@@ -19,7 +19,7 @@ typedef unsigned long long u64;
 
 typedef struct spindrv_ioctl_inc_s {
     u64 dma_addr;
-    unsigned size;
+    unsigned long size;
     void* addr, * addr_virt, *addr_phys, *key;
 } spindrv_ioctl_inc_t;
 
@@ -45,6 +45,8 @@ typedef union spindrv_ioctl_param_u {
 #define SPIN_IOCTL_REMOVE    _IOW(SPIN_MAGIC, 2, int)
 #define SPIN_IOCTL_READ    _IOW(SPIN_MAGIC, 3, int)
 #define SPIN_IOCTL_READ_O    _IOW(SPIN_MAGIC, 4, int)
+
+#define SPIN_IOCTL_ADDR_TEST    _IOW(SPIN_MAGIC, 5, int)
 
 
 #endif /* SPIN_H */

@@ -25,6 +25,10 @@
 #include <linux/mmu_notifier.h>
 #include <linux/radix-tree.h>
 
+#include <linux/compiler.h>
+
+#include <linux/sched/mm.h>
+
 #define RAV 1024*1024                /* Max size to consider PC RA (Bytes)  */
 #define CONS 256                     /* Minimum streak of PC read (Pages)   */
 #define RAPC 512                     /* Size of PC (Pages)                  */
@@ -36,8 +40,35 @@
 #define MAX(x, y) (((x) > (y)) ? (x) : (y))
 #define MIN(x, y) (((x) < (y)) ? (x) : (y))
 
-SETPAGEFLAG(f, arch_1)
-CLEARPAGEFLAG(f, arch_1)
+
+#include "map.h"
+#include <nv-p2p.h>
+
+
+//SETPAGEFLAG(f, arch_1, PF_ANY)
+static __always_inline void SetPagef(struct page *page) \
+	{ set_bit(PG_arch_1, &page->flags); }
+//CLEARPAGEFLAG(f, arch_1)
+static __always_inline void ClearPagef(struct page *page)	\
+	{ clear_bit(PG_arch_1, &page->flags); }
+
+/*
+static struct mm_struct *get_task_mm(struct task_struct *task)
+{
+	struct mm_struct *mm;
+
+	task_lock(task);
+	mm = task->mm;
+	if (mm) {
+		if (task->flags & PF_KTHREAD)
+			mm = NULL;
+		else
+			atomic_inc(&mm->mm_users);
+	}
+	task_unlock(task);
+	return mm;
+}
+*/
 
 static int major_number;
 static struct class* spindrv_class = NULL;
@@ -378,6 +409,7 @@ static int spindrv_open(struct inode *inode, struct file *file)
 	struct task_struct *t;
 	struct pid_pages* pid_page;
 	t = current;
+    pr_info("%s\n", __func__);
 	do {
 
 		list_for_each_entry(pid_page, &(pid_pages_list.list), list)
@@ -389,6 +421,7 @@ static int spindrv_open(struct inode *inode, struct file *file)
 		t = t->parent;
 	} while (t->pid != 0);
 
+    pr_info("%s end\n", __func__);
 
 	return 0;
 }
@@ -505,6 +538,88 @@ static struct mmu_notifier notify = {
 	.ops = &no_ops,
 };
 
+
+static void spindrv_get_pages_free_callback(void* data)
+{
+    struct nvidia_p2p_page_table* page_table = data;
+    if (page_table) {
+        nvidia_p2p_free_page_table(page_table);
+    }
+    else {
+        printk("nvidia get page free callback, page table is NULL\n");
+    }
+}
+
+//static int nvidia_translate_virt(u64 virt_addr, u64 size)
+static u64 nvidia_translate_virt(u64 virt_addr, u64 size)
+{
+    int ret = 0;
+    struct nvidia_p2p_page_table *page_table = NULL;
+    u64 page_virt_start = virt_addr & GPU_PAGE_MASK;
+    u64 page_virt_end = virt_addr + size - 1;
+    size_t rounded_size = page_virt_end - page_virt_start + 1;
+
+    printk("invoking nvidia_p2p_get_pages(va=0x%llx len=%ld)", page_virt_start, rounded_size);
+    ret = nvidia_p2p_get_pages(0/*token*/, 0/*va_space*/, virt_addr, rounded_size, &page_table,
+                                spindrv_get_pages_free_callback, page_table);
+    
+    if (ret < 0 || !page_table) {
+        printk("nvidia_p2p_get_pages(va=0x%llx len=%ld) failted [ret = %d]\n", page_virt_start, rounded_size, ret);
+        goto out;
+    }
+    if (page_table->page_size != NVIDIA_P2P_PAGE_SIZE_64KB) {
+        printk("nvidia_p2p_get_pages assumption of 64KB pages failed size_id = %d\n", page_table->page_size);
+        goto out;
+    }   
+    {
+        int i, p = 0;
+        u64 vaddr, paddr;
+        unsigned nentries;
+        size_t len;
+        printk("page table entries: %d\n", page_table->entries);
+        for (i = 0; i < page_table->entries; i++) {
+            printk("page[%d] = 0x%016llx\n", i, page_table->pages[i]->physical_address);
+        }
+        
+        vaddr = page_virt_start;
+        do {
+            paddr = page_table->pages[p]->physical_address;
+            nentries = 1;
+            ++p;
+            {
+                u64 prev_page_addr = page_table->pages[p-1]->physical_address;
+                for (; p < page_table->entries; p++) {
+                    struct nvidia_p2p_page* page = page_table->pages[p];
+                    u64 curr_page_addr = page->physical_address;
+                    if (prev_page_addr + GPU_PAGE_SIZE != curr_page_addr) {
+                        printk("non-contiguous p=%d prev_page_addr=%llx curr_page_addr=%llx\n",
+                                p, prev_page_addr, curr_page_addr);
+                        break;
+                    }
+                    prev_page_addr = curr_page_addr;
+                    ++nentries;
+                }
+            }
+            len = MIN(size, GPU_PAGE_SIZE * nentries);
+            printk("mapping p=%u entries=%d len=%lu vaddr=%llx paddr=%llx\n",
+                    p, nentries, len, vaddr, paddr);
+            
+            vaddr += len;
+            size -= len;
+        } while(size && p < page_table->entries);
+
+        if (page_table->entries) {
+            return page_table->pages[0]->physical_address;
+        }
+    }
+
+out:
+    return ret;
+  
+}
+
+
+
 static void* translate_virt(void* addr_virt, struct mm_struct *mm,
 	unsigned long * length, void** virt_start)
 {
@@ -512,10 +627,19 @@ static void* translate_virt(void* addr_virt, struct mm_struct *mm,
 	unsigned long pfn;
 	if (addr_virt) {
 		vma = find_vma(mm, (unsigned long) (addr_virt));
-		if (!vma || !(vma->vm_flags & VM_PFNMAP)) {
-			return NULL;
+        pr_info("%s - vma %p\n", __func__, vma);
+		
+        if (!vma || !(vma->vm_flags & VM_PFNMAP) 
+            || !(vma->vm_flags & VM_IO)) 
+        {   
+            if (vma) {
+                pr_info("vma [%lx,%lx] flags %lu\n", vma->vm_start, vma->vm_end, vma->vm_flags);
+		        follow_pfn(vma, (unsigned long) (vma->vm_start), &pfn);
+		        pr_info("physical addr %p\n", (void*) (pfn << PAGE_SHIFT));
+            }
+            return NULL;
 		}
-
+        //pr_info("vma [%p,%p]\n", vma->vm_start, vma->vm_end);
 		if (follow_pfn(vma, (unsigned long) (vma->vm_start), &pfn)) {
 			return NULL;
 		}
@@ -804,6 +928,19 @@ static long spindrv_ioctl(struct file *file, unsigned int ioctl_num, unsigned lo
 	}
 
 	switch (ioctl_num) {
+    
+    case SPIN_IOCTL_ADDR_TEST:
+    {
+		void* addr;
+		void* gpu_addr_phys, *virt_start, *key_return;
+		unsigned long size, gpu_length, offset_return, ubuffer_size;
+        addr = local_param.set.addr;
+	    size = local_param.set.size;
+        pr_info(KERN_WARNING "spin: addr test %lx\n", (unsigned long)addr);
+	    ret = nvidia_translate_virt((u64)addr, size);
+
+        break;
+    }
 
 	case SPIN_IOCTL_NEW_BUFFER:
 	{
@@ -893,7 +1030,7 @@ static long spindrv_ioctl(struct file *file, unsigned int ioctl_num, unsigned lo
 				ubuffer_size = DIV_ROUND_UP(local_param.readArgs.count + (local_param.readArgs.offset % 4096), 4096);
 				ubuffer = (int *) kzalloc(ubuffer_size * sizeof(int), GFP_KERNEL);
 				perinPC = get_mypc(f, local_param.readArgs.count, local_param.readArgs.offset, ubuffer);
-
+                
 				if ((unsigned long) (f.file->private_data) == 0) {
 					if (f.file->f_inode != NULL) {
 						if (f.file->f_inode->i_sb != NULL) {
@@ -941,7 +1078,8 @@ static long spindrv_ioctl(struct file *file, unsigned int ioctl_num, unsigned lo
 						}
 					}
 				}
-
+                
+                /*
 				if ((unsigned long) (f.file->private_data) == 1) {
 					local_param.readArgs.read_return = my_read(f, local_param.readArgs.buf,
 						local_param.readArgs.count,
@@ -949,8 +1087,9 @@ static long spindrv_ioctl(struct file *file, unsigned int ioctl_num, unsigned lo
 					fdput(f);
 					copy_to_user((void *) ioctl_param, (void*) &local_param, sizeof(spindrv_ioctl_param_union));
 					kfree(ubuffer);
-					return 2;
+					return 9;
 				}
+                */
 			} while (false);
 
 			spin_lock(&checklock);
@@ -1015,7 +1154,8 @@ static long spindrv_ioctl(struct file *file, unsigned int ioctl_num, unsigned lo
 				return 1;
 			}
 
-			gpu_addr_phys = translate_virt(local_param.readArgs.buf, current->mm, &(gpu_length), &virt_start);
+			//gpu_addr_phys = translate_virt(local_param.readArgs.buf, current->mm, &(gpu_length), &virt_start);
+            gpu_addr_phys = nvidia_translate_virt((u64)local_param.readArgs.buf, (u64)local_param.readArgs.count);
 
 			if (!gpu_addr_phys) {
 				spin_unlock(&checklock);
@@ -1076,6 +1216,7 @@ static long spindrv_ioctl(struct file *file, unsigned int ioctl_num, unsigned lo
 }
 
 struct file_operations spindrv_dev_fops = {
+    .owner = THIS_MODULE,
 	.unlocked_ioctl = spindrv_ioctl,
 	.open = spindrv_open,
 	.release = spindrv_close,
@@ -1083,21 +1224,21 @@ struct file_operations spindrv_dev_fops = {
 
 static int __init spindrv_init(void)
 {
-	printk("spin: Initializing spin\n");
+	pr_info("spin: Initializing spin\n");
 	major_number = register_chrdev(0, DEVICE_NAME, &spindrv_dev_fops);
 
 	if (major_number < 0) {
-		printk("spin: failed to register a major number\n");
+		pr_info("spin: failed to register a major number\n");
 		return major_number;
 	}
 
-	printk("spin: registered correctly with major number %d\n", major_number);
+	pr_info("spin: registered correctly with major number %d\n", major_number);
 
 	spindrv_class = class_create(THIS_MODULE, CLASS_NAME);
 
 	if (IS_ERR(spindrv_class)) { // Check for error and clean up if there is
 		unregister_chrdev(major_number, DEVICE_NAME);
-		printk(KERN_ALERT "spin: Failed to register device class\n");
+		pr_info(KERN_ALERT "spin: Failed to register device class\n");
 		return PTR_ERR(spindrv_class); // Correct way to return an error on a pointer
 	}
 
@@ -1106,7 +1247,7 @@ static int __init spindrv_init(void)
 	if (IS_ERR(spindrv_device)) { // Clean up if there is an error
 		class_destroy(spindrv_class); // Repeated code but the alternative is goto statements
 		unregister_chrdev(major_number, DEVICE_NAME);
-		printk("spin: Failed to create the device\n");
+		pr_info("spin: Failed to create the device\n");
 		return PTR_ERR(spindrv_device);
 	}
 
@@ -1129,7 +1270,7 @@ static void __exit spindrv_exit(void)
 	class_unregister(spindrv_class);
 	class_destroy(spindrv_class);
 	unregister_chrdev(major_number, DEVICE_NAME);
-	printk("spin: Goodbye from spin!\n");
+	pr_info("spin: Goodbye from spin!\n");
 
 }
 

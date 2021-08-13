@@ -1,4 +1,4 @@
-MODULENAME=spindrv
+MODULENAME=spin-drv
 
 obj-m += $(MODULENAME).o
 

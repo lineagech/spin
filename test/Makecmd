@@ -1,0 +1,1 @@
+g++ -g -std=c++11 -L../libspin -I../spindrv/include test_spindrv_2.cpp -o test_spindrv_2 -lspin -ldl

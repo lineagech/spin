@@ -1,2 +1,5 @@
-obj-m := spindrv.o
+obj-m := spin-drv.o
+spin-drv-y := spindrv.o map.o list.o
 ccflags-y := -I$(src)/include
+KBUILD_EXTRA_SYMBOLS = /export/home/cuc1057/p2p_research/nvidia-460.91.03/Module.symvers
+EXTRA_CFLAGS += -I/usr/src/nvidia-460.91.03/nvidia/

@@ -2,9 +2,12 @@ CC = g++
 LDFLAGS = -shared
 CXXFLAGS += -fPIC
 CXXFLAGS += -Wall
-CXXFLAGS += -O3
+CXXFLAGS += -g
+CXXFLAGS += -I../spindrv/include/
+
 RM = rm -f
-TARGET_LIB = libspin.so
+#TARGET_LIB = libspin.so
+TARGET_LIB = libspin.a
 
 SRCS = spin.cpp
 OBJS = $(SRCS:.cpp=.o)
@@ -13,7 +16,9 @@ OBJS = $(SRCS:.cpp=.o)
 all: ${TARGET_LIB}
 
 $(TARGET_LIB): $(OBJS)
-	$(CC) ${LDFLAGS} -o $@ $^ -ldl
+	#$(CC) -g ${LDFLAGS} -o $@ $^ -ldl
+	ar rc $@ $^
+	ranlib $@
 
 .PHONY: clean
 clean:

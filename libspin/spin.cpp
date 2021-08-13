@@ -6,7 +6,8 @@
 #include <sys/ioctl.h>
 #include <sys/types.h>
 #include <linux/unistd.h>
-#include <spin/spindrv.h>
+//#include <spin/spindrv.h>
+#include <spindrv.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -89,6 +90,11 @@ errCleanup:
 void myinit(void)
 {
 	_ini();
+}
+
+void myend(void)
+{
+    _fini();
 }
 
 static void _fini()
